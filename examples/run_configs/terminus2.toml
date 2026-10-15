@@ -1,0 +1,37 @@
+# A run config: how one Harbor task runs on its own EC2 box, everything except the task.
+# This one runs terminus-2, Harbor's own agent, against an OpenAI-compatible endpoint (vLLM, SGLang, ...).
+#   ./run examples/tasks/hello examples/run_configs/terminus2.toml
+# The config is copied into the record as spec.json, so never put a secret in it.
+
+record = "s3://my-bucket/trials"   # each trial lands in <record>/<trial-id>/
+
+[box]                    # read on your machine, before anything is created
+instance_type = "m7i.xlarge"
+disk          = 100      # GB: Docker, Harbor, the task's images and the record
+max_minutes   = 180      # the box powers off, and is deleted, this long after boot: keep it above the
+                         # task's own timeouts, or the box dies first and the record is lost
+
+[routes]
+# Model endpoints, named after the environment variable you would export on your laptop and set to the
+# real base URL. Harbor runs with each variable pointing at the box's proxy instead, as
+# http://172.17.0.1:8100/<NAME>, which records every call and forwards it to the real URL. Harbor's own
+# process and the task's containers can both reach that address. An endpoint only reachable on your
+# tailnet needs TS_AUTHKEY set when you run.
+OPENAI_BASE_URL = "http://my-endpoint:8000/v1"
+
+[harbor]                 # read on the box
+package = "harbor @ git+https://github.com/harbor-framework/harbor@4d1dcfb25470f66daa3b3a169e061b55ab75ce45"   # anything `uv tool install` takes
+# What you would pass to `harbor trial start` on your laptop. The runner adds the rest: -p <task>, the
+# output folder (--trials-dir, --trial-name) and --environment-kwarg keep_containers=true, which keeps
+# the containers for the record. $VARS expand as in a shell. Harbor must use its local Docker
+# environment: the box is the sandbox.
+# terminus-2 runs inside Harbor's own process and takes its endpoint as the agent kwarg api_base.
+# "openai/" tells LiteLLM, which terminus-2 calls through, that the endpoint speaks the OpenAI API;
+# the rest is the model's name as the endpoint serves it.
+args = ["-a", "terminus-2",
+        "-m", "openai/my-model",
+        "--agent-kwarg", "api_base=$OPENAI_BASE_URL"]
+# Environment for Harbor's process. LiteLLM gives up on a call after 600 s unless REQUEST_TIMEOUT is
+# set, while a model can take longer to answer. The key is sent to the endpoint as is: a placeholder,
+# since this file goes into the record.
+env = { OPENAI_API_KEY = "unused", REQUEST_TIMEOUT = "4000" }

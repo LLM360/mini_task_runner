@@ -1,0 +1,22 @@
+# A run config: how one Harbor task runs on its own EC2 box, everything except the task.
+# This one runs Harbor's oracle agent, which applies the task's own solution, so it needs no model:
+# it checks the box, Harbor and the record end to end.
+#   ./run examples/tasks/hello examples/run_configs/oracle.toml
+# The config is copied into the record as spec.json, so never put a secret in it.
+
+record = "s3://my-bucket/trials"   # each trial lands in <record>/<trial-id>/
+
+[box]                    # read on your machine, before anything is created
+instance_type = "t3.large"
+disk          = 40       # GB: Docker, Harbor, the task's images and the record
+max_minutes   = 30       # the box powers off, and is deleted, this long after boot
+
+[routes]                 # none: the oracle calls no model (see terminus2.toml)
+
+[harbor]                 # read on the box
+package = "harbor @ git+https://github.com/harbor-framework/harbor@4d1dcfb25470f66daa3b3a169e061b55ab75ce45"   # anything `uv tool install` takes
+# What you would pass to `harbor trial start` on your laptop. The runner adds the rest: -p <task>, the
+# output folder (--trials-dir, --trial-name) and --environment-kwarg keep_containers=true, which keeps
+# the containers for the record. Harbor must use its local Docker environment: the box is the sandbox.
+args = ["-a", "oracle"]
+env  = {}                # environment for Harbor's process

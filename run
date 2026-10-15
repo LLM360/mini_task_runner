@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# run <task-dir> <run_config.toml>: launch one trial of a Harbor task on its own EC2 box, then leave.
+# The box runs runner/conductor.sh as the systemd service "trial", uploads the record to
+# <record>/<trial-id>/ and deletes itself. Prints "<trial-id>  <ip>  <record>/<trial-id>/".
+#
+#   ./run examples/tasks/hello examples/run_configs/oracle.toml
+#
+# AWS: your usual credentials (AWS_PROFILE, environment variables, ~/.aws). They launch the box, and
+# give it keys of its own (see below).
+# Tailscale: TS_AUTHKEY from your environment, if the model endpoints are only reachable on your tailnet.
+set -euo pipefail
+USAGE="usage: run <task-dir> <run_config.toml>"
+TASK=${1:?$USAGE} CONFIG=${2:?$USAGE}
+HERE=$(cd "$(dirname "$0")" && pwd)
+NAME=$(basename "$TASK")
+# The trial id names the box, its tailnet node, its AWS session and its folder in S3, so it keeps only
+# characters all of them accept, and 63 at most (a DNS label's limit). spec.json keeps the task's name.
+ID=${NAME//[^a-zA-Z0-9-]/-}
+ID=${ID:0:54}-$(openssl rand -hex 4)
+T=/tmp/$ID
+
+mkdir "$T"
+cp -R "$TASK" "$T/task"
+cp -R "$HERE/box" "$T/runner"
+py() { uv run -q --no-project --python '>=3.11' python "$@"; }   # uv's Python 3.11+ (tomllib)
+# spec.json is the run config plus trial_id, task and launched_at.
+py - "$CONFIG" "$ID" "$NAME" > "$T/spec.json" <<'EOF'
+import json, sys, time, tomllib
+config = tomllib.load(open(sys.argv[1], "rb"))
+launched_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+print(json.dumps({**config, "trial_id": sys.argv[2], "task": sys.argv[3], "launched_at": launched_at}, indent=2))
+EOF
+
+spec() {  # spec <key>[.<key>]: a field of the trial's spec.json, e.g. spec box.disk
+  py -c 'import functools, json, sys; print(functools.reduce(lambda v, k: v[k], sys.argv[2].split("."), json.load(open(sys.argv[1]))))' \
+    "$T/spec.json" "$1"
+}
+# Every field run uses is read here, before the first AWS call, so a run config without one stops run.
+RECORD=$(spec record)/$ID
+TYPE=$(spec box.instance_type)
+DISK=$(spec box.disk)
+MAX=$(spec box.max_minutes)
+
+# The box's secrets go next to the trial folder, never in it: TS_AUTHKEY if you set one, and AWS keys
+# that can only write this trial's folder, until 30 minutes past the box's deadline. The keys are made
+# from your own credentials with GetFederationToken, or, if RECORD_ROLE holds a role's ARN, by taking on
+# that role: for a bucket only a role can write. The denies matter when the bucket's own policy grants
+# more, such as reading the whole bucket: a session policy's allow can't narrow that, but its deny can.
+# AWS refuses a session longer than it allows (12 h for most roles, 36 h for GetFederationToken) here,
+# before anything is created.
+FOLDER=arn:aws:s3:::${RECORD#s3://}/*
+POLICY='{"Version":"2012-10-17","Statement":['\
+'{"Effect":"Allow","Action":"s3:PutObject","Resource":"'$FOLDER'"},'\
+'{"Effect":"Deny","NotAction":"s3:PutObject","Resource":"*"},'\
+'{"Effect":"Deny","Action":"s3:PutObject","NotResource":"'$FOLDER'"}]}'
+LIFETIME=$(( MAX * 60 + 1800 ))
+QUERY='Credentials.[AccessKeyId,SecretAccessKey,SessionToken]'
+if [ -n "${RECORD_ROLE:-}" ]; then
+  KEYS=$(aws sts assume-role --role-arn "$RECORD_ROLE" --role-session-name "$ID" \
+    --duration-seconds $LIFETIME --policy "$POLICY" --query "$QUERY" --output text)
+else
+  KEYS=$(aws sts get-federation-token --name "${ID:0:32}" \
+    --duration-seconds $LIFETIME --policy "$POLICY" --query "$QUERY" --output text)
+fi
+read -r AK SK ST <<< "$KEYS"
+umask 077
+{
+  [ -z "${TS_AUTHKEY:-}" ] || echo "TS_AUTHKEY=$TS_AUTHKEY"
+  printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\nAWS_SESSION_TOKEN=%s\n' "$AK" "$SK" "$ST"
+} > "$T.env"
+
+MAX_MINUTES=$MAX bash "$HERE/ec2/create_one.sh" "$ID" 1 "$TYPE" "$DISK" > /dev/null
+# The launch list: spec.json in S3 says a box was launched; upload.json, written last by the box, says
+# its record is complete. It goes up once the box exists, so a launch that fails leaves nothing in S3.
+AWS_ACCESS_KEY_ID=$AK AWS_SECRET_ACCESS_KEY=$SK AWS_SESSION_TOKEN=$ST \
+  aws s3 cp --only-show-errors "$T/spec.json" "$RECORD/spec.json"
+until IP=$(bash "$HERE/ec2/list_fleet.sh" "$ID"); [ -n "$IP" ]; do sleep 5; done
+ENV_FILE=$T.env DIR=$T UNIT=trial bash "$HERE/ec2/run_script.sh" "$IP" "$T/runner/conductor.sh" "/root/$ID"
+rm "$T.env"
+echo "$ID  $IP  $RECORD/"
