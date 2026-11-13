@@ -16,6 +16,7 @@ observability: everything about the trial lands in S3 for post-mortem analysis. 
 ```
 Copy a file from `examples/run_configs/` to write your own; its comments explain every field.
 - `RECORD_ROLE=<role-arn>`: if only a role can write your bucket.
+- `RECORD_PRESIGN=1`: if your credentials can do neither. The box gets no AWS key, only signed permission to upload into its trial's folder (`presign.py`; 5 GB a file at most).
 - `TS_AUTHKEY=<key>`: if the endpoint is only on your tailnet.
 
 ## Watch, stop

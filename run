@@ -55,25 +55,42 @@ POLICY='{"Version":"2012-10-17","Statement":['\
 '{"Effect":"Deny","Action":"s3:PutObject","NotResource":"'$FOLDER'"}]}'
 LIFETIME=$(( MAX * 60 + 1800 ))
 QUERY='Credentials.[AccessKeyId,SecretAccessKey,SessionToken]'
-if [ -n "${RECORD_ROLE:-}" ]; then
-  KEYS=$(aws sts assume-role --role-arn "$RECORD_ROLE" --role-session-name "$ID" \
-    --duration-seconds $LIFETIME --policy "$POLICY" --query "$QUERY" --output text)
-else
-  KEYS=$(aws sts get-federation-token --name "${ID:0:32}" \
-    --duration-seconds $LIFETIME --policy "$POLICY" --query "$QUERY" --output text)
-fi
-read -r AK SK ST <<< "$KEYS"
 umask 077
-{
-  [ -z "${TS_AUTHKEY:-}" ] || echo "TS_AUTHKEY=$TS_AUTHKEY"
-  printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\nAWS_SESSION_TOKEN=%s\n' "$AK" "$SK" "$ST"
-} > "$T.env"
+[ -z "${TS_AUTHKEY:-}" ] || echo "TS_AUTHKEY=$TS_AUTHKEY" > "$T.env"
+# HARBOR_SECRETS names variables of yours that Harbor's process on the box should have but the record
+# must not, such as a model API key a seat asks for as "${NAME}": spec.json and [harbor] env are
+# uploaded, these are not, and box/scrub.py removes their values from the record before it goes up.
+for name in ${HARBOR_SECRETS:-}; do
+  [[ "${!name:-}" =~ ^[A-Za-z0-9._~+/=-]+$ ]] || { echo "HARBOR_SECRETS: $name is unset or has characters a token would not" >&2; exit 1; }
+  echo "HARBOR_SECRET_$name=${!name}" >> "$T.env"
+done
+if [ -n "${RECORD_PRESIGN:-}" ]; then
+  # For credentials that can do neither: the box gets no key, only signed permission to POST files
+  # into this trial's folder until the same deadline (presign.py). spec.json goes up as you.
+  REGION=$(aws s3api get-bucket-location --bucket "$(cut -d/ -f3 <<< "$RECORD")" --query LocationConstraint --output text)
+  [ "$REGION" != None ] || REGION=us-east-1
+  (eval "$(aws configure export-credentials --format env)" && py "$HERE/presign.py" "$RECORD" "$REGION" "$LIFETIME") >> "$T.env"
+  put_spec() { aws s3 cp --only-show-errors "$T/spec.json" "$RECORD/spec.json"; }
+else
+  if [ -n "${RECORD_ROLE:-}" ]; then
+    KEYS=$(aws sts assume-role --role-arn "$RECORD_ROLE" --role-session-name "$ID" \
+      --duration-seconds $LIFETIME --policy "$POLICY" --query "$QUERY" --output text)
+  else
+    KEYS=$(aws sts get-federation-token --name "${ID:0:32}" \
+      --duration-seconds $LIFETIME --policy "$POLICY" --query "$QUERY" --output text)
+  fi
+  read -r AK SK ST <<< "$KEYS"
+  printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\nAWS_SESSION_TOKEN=%s\n' "$AK" "$SK" "$ST" >> "$T.env"
+  put_spec() {
+    AWS_ACCESS_KEY_ID=$AK AWS_SECRET_ACCESS_KEY=$SK AWS_SESSION_TOKEN=$ST \
+      aws s3 cp --only-show-errors "$T/spec.json" "$RECORD/spec.json"
+  }
+fi
 
 MAX_MINUTES=$MAX bash "$HERE/ec2/create_one.sh" "$ID" 1 "$TYPE" "$DISK" > /dev/null
 # The launch list: spec.json in S3 says a box was launched; upload.json, written last by the box, says
 # its record is complete. It goes up once the box exists, so a launch that fails leaves nothing in S3.
-AWS_ACCESS_KEY_ID=$AK AWS_SECRET_ACCESS_KEY=$SK AWS_SESSION_TOKEN=$ST \
-  aws s3 cp --only-show-errors "$T/spec.json" "$RECORD/spec.json"
+put_spec
 until IP=$(bash "$HERE/ec2/list_fleet.sh" "$ID"); [ -n "$IP" ]; do sleep 5; done
 ENV_FILE=$T.env DIR=$T UNIT=trial bash "$HERE/ec2/run_script.sh" "$IP" "$T/runner/conductor.sh" "/root/$ID"
 rm "$T.env"

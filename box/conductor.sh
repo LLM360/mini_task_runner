@@ -22,11 +22,12 @@ routes() {  # routes <format>: one line per route in spec.json, with {name} and 
   python3 -c 'import json, sys; [print(sys.argv[1].format(name=n, url=u)) for n, u in json.load(open("spec.json"))["routes"].items()]' "$1"
 }
 
-with_harbor() {  # with_harbor <command...>: run it with [harbor] args appended and [harbor] env set, each route's variable pointing at the proxy, and $VARS in args and env expanded as a shell would
+with_harbor() {  # with_harbor <command...>: run it with [harbor] args appended and [harbor] env set, each route's variable pointing at the proxy, the HARBOR_SECRET_<NAME>s of /root/.env set as <NAME>, and $VARS in args and env expanded as a shell would
   python3 -c '
 import json, os, sys
 s = json.load(open("spec.json"))
 os.environ.update({name: f"{sys.argv[1]}/{name}" for name in s["routes"]})
+os.environ.update(line[len("HARBOR_SECRET_"):].rstrip("\n").split("=", 1) for line in open("/root/.env") if line.startswith("HARBOR_SECRET_"))
 os.environ.update({k: os.path.expandvars(str(v)) for k, v in s["harbor"]["env"].items()})
 os.execvp(sys.argv[2], sys.argv[2:] + [os.path.expandvars(a) for a in s["harbor"]["args"]])' "$PROXY" "$@"
 }
@@ -43,6 +44,7 @@ step() {  # step <name> <command...>
 runner/boxwatch.py box > box/steps/boxwatch.log 2>&1 &
 boxwatch=$!
 step setup runner/setup.sh "$(spec harbor.package)"
+[ "$(spec box.kube 2>/dev/null)" != True ] || step kube runner/kube.sh   # only for a Helm-chart task
 step tailnet runner/tailnet.sh join "$(spec trial_id)"
 runner/proxy.py model_calls "$PORT" $(routes '{name}={url}') > box/steps/proxy.log 2>&1 &
 proxy=$!
@@ -52,5 +54,6 @@ kill "$proxy" "$boxwatch"
 wait "$proxy" "$boxwatch" 2>/dev/null   # without this, bash reports each stopped recorder as "Terminated"
 step network runner/tailnet.sh ping $(routes '{url}')
 step services runner/services.sh services
+step scrub runner/scrub.py .   # no HARBOR_SECRETS value may reach the record
 step upload runner/upload.sh . "$(spec record)/$(spec trial_id)"
 poweroff
